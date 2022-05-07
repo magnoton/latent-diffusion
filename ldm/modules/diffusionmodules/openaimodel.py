@@ -1,12 +1,14 @@
 from abc import abstractmethod
 from functools import partial
 import math
-from typing import Iterable
+from typing import Iterable, List
 
 import numpy as np
 import torch as th
+import torch.jit
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.jit import isinstance as jitisinstance
 
 from ldm.modules.diffusionmodules.util import (
     checkpoint,
@@ -58,7 +60,6 @@ class AttentionPool2d(nn.Module):
         x = self.c_proj(x)
         return x[:, :, 0]
 
-
 class TimestepBlock(nn.Module):
     """
     Any module where forward() takes timestep embeddings as a second argument.
@@ -69,23 +70,60 @@ class TimestepBlock(nn.Module):
         """
         Apply the module to `x` given `emb` timestep embeddings.
         """
-
+from collections import OrderedDict
 
 class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
     A sequential module that passes timestep embeddings to the children that
     support it as an extra input.
     """
+    usesEmbedding: List[bool]
+
+    def __init__(self, *args):
+        super(nn.Sequential, self).__init__()
+        super().__init__(*args)
+        self.usesEmbedding = []
+        if len(args) == 1 and isinstance(args[0], OrderedDict):
+            for key, module in args[0].items():
+                if isinstance(module, TimestepBlock) or isinstance(module, SpatialTransformer):
+                    self.usesEmbedding.append(True)
+                else:
+                    self.usesEmbedding.append(False)
+        else:
+            for idx, module in enumerate(args):
+                if isinstance(module, TimestepBlock) or isinstance(module, SpatialTransformer):
+                    self.usesEmbedding.append(True)
+                else:
+                    self.usesEmbedding.append(False)
+        print(f'initialized with {self.usesEmbedding} layers {self}')
 
     def forward(self, x, emb, context=None):
-        for layer in self:
-            if isinstance(layer, TimestepBlock):
-                x = layer(x, emb)
-            elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
-            else:
+        for idx, layer in enumerate(self):
+            if True:
                 x = layer(x)
+            else:
+                x = layer(x, emb, context)
         return x
+
+    def append(self, module: nn.Module) -> 'Sequential':
+        r"""Appends a given module to the end.
+
+        Args:
+            module (nn.Module): module to append
+        """
+        super().add_module(str(len(self)), module)
+        if isinstance(module, TimestepBlock) or isinstance(module, SpatialTransformer):
+            self.usesEmbedding.append(True)
+        else:
+            self.usesEmbedding.append(False)
+        return self
+
+class Conv2dOverloaded(nn.Conv2d):
+    """
+    Conv2d but with unused extra params for removing polymorphism in TimestepEmbedSequential
+    """
+    def forward(self, x, emb, context=None):
+        return super().forward(x)
 
 
 class Upsample(nn.Module):
@@ -240,7 +278,7 @@ class ResBlock(TimestepBlock):
         else:
             self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
 
-    def forward(self, x, emb):
+    def forward(self, x, emb, context=None):
         """
         Apply the block to a Tensor, conditioned on a timestep embedding.
         :param x: an [N x C x ...] Tensor of features.
@@ -448,7 +486,7 @@ class UNetModel(nn.Module):
         out_channels,
         num_res_blocks,
         attention_resolutions,
-        dropout=0,
+        dropout=0.0,
         channel_mult=(1, 2, 4, 8),
         conv_resample=True,
         dims=2,
@@ -515,9 +553,9 @@ class UNetModel(nn.Module):
 
         self.input_blocks = nn.ModuleList(
             [
-                TimestepEmbedSequential(
+                torch.jit.script(TimestepEmbedSequential(
                     conv_nd(dims, in_channels, model_channels, 3, padding=1)
-                )
+                ))
             ]
         )
         self._feature_size = model_channels
@@ -558,13 +596,14 @@ class UNetModel(nn.Module):
                             ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
                         )
                     )
-                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                print(f"layers563 {layers}")
+                self.input_blocks.append(torch.jit.script(TimestepEmbedSequential(*layers)))
                 self._feature_size += ch
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
                 out_ch = ch
                 self.input_blocks.append(
-                    TimestepEmbedSequential(
+                    torch.jit.script(TimestepEmbedSequential(
                         ResBlock(
                             ch,
                             time_embed_dim,
@@ -579,7 +618,7 @@ class UNetModel(nn.Module):
                         else Downsample(
                             ch, conv_resample, dims=dims, out_channels=out_ch
                         )
-                    )
+                    ))
                 )
                 ch = out_ch
                 input_block_chans.append(ch)
@@ -594,7 +633,7 @@ class UNetModel(nn.Module):
         if legacy:
             #num_heads = 1
             dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
-        self.middle_block = TimestepEmbedSequential(
+        self.middle_block = torch.jit.script(TimestepEmbedSequential(
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -620,7 +659,7 @@ class UNetModel(nn.Module):
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
-        )
+        ))
         self._feature_size += ch
 
         self.output_blocks = nn.ModuleList([])
@@ -676,7 +715,8 @@ class UNetModel(nn.Module):
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                     )
                     ds //= 2
-                self.output_blocks.append(TimestepEmbedSequential(*layers))
+                print(f"layers682 {layers}")
+                self.output_blocks.append(torch.jit.script(TimestepEmbedSequential(*layers)))
                 self._feature_size += ch
 
         self.out = nn.Sequential(
@@ -707,7 +747,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -800,9 +840,9 @@ class EncoderUNetModel(nn.Module):
 
         self.input_blocks = nn.ModuleList(
             [
-                TimestepEmbedSequential(
+                torch.jit.script(TimestepEmbedSequential(
                     conv_nd(dims, in_channels, model_channels, 3, padding=1)
-                )
+                ))
             ]
         )
         self._feature_size = model_channels
@@ -833,13 +873,14 @@ class EncoderUNetModel(nn.Module):
                             use_new_attention_order=use_new_attention_order,
                         )
                     )
-                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                print(f"layers840 {layers}")
+                self.input_blocks.append(torch.jit.script(TimestepEmbedSequential(*layers)))
                 self._feature_size += ch
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
                 out_ch = ch
                 self.input_blocks.append(
-                    TimestepEmbedSequential(
+                    torch.jit.script(TimestepEmbedSequential(
                         ResBlock(
                             ch,
                             time_embed_dim,
@@ -856,12 +897,13 @@ class EncoderUNetModel(nn.Module):
                         )
                     )
                 )
+                )
                 ch = out_ch
                 input_block_chans.append(ch)
                 ds *= 2
                 self._feature_size += ch
 
-        self.middle_block = TimestepEmbedSequential(
+        self.middle_block = torch.jit.script(TimestepEmbedSequential(
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -885,7 +927,7 @@ class EncoderUNetModel(nn.Module):
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
-        )
+        ))
         self._feature_size += ch
         self.pool = pool
         if pool == "adaptive":

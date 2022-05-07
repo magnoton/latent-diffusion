@@ -25,6 +25,8 @@ from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, Autoenc
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
 
+from shark.shark_runner import SharkInference
+
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -984,7 +986,27 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
-            x_recon = self.model(x_noisy, t, **cond)
+            #print(f'cond: {cond.keys()}')
+            
+            # TODO: unsure how to properly unpack dictionary into the tuple here
+            # seems shark can't handle kwargs properly here, unpacking it manually as expected as a workaround:
+
+            c_concat = None
+            c_crossattn = None
+            if hasattr(cond, 'c_concat'):
+                c_concat = cond['c_concat']
+            if hasattr(cond, 'c_crossattn'):
+                c_crossattn = cond['c_crossattn']
+            
+            shark_args = (x_noisy, t, c_concat, c_crossattn)
+            shark_module = SharkInference(self.model, shark_args, dynamic=True)
+            x_recon = shark_module.forward(shark_args)
+            
+            #x_recon = self.model(x_noisy, t, **cond)
+
+
+            # original call
+            # x_recon = self.model(x_noisy, t, **cond)
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]

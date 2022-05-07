@@ -10,6 +10,8 @@
 
 import os
 import math
+import typing
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -99,7 +101,8 @@ def extract_into_tensor(a, t, x_shape):
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
-def checkpoint(func, inputs, params, flag):
+def checkpoint(func, inputs: typing.Tuple[torch.Tensor],
+               params: typing.List[torch.nn.Parameter], flag):
     """
     Evaluate a function without caching intermediate activations, allowing for
     reduced memory at the expense of extra compute in the backward pass.
@@ -202,7 +205,7 @@ def normalization(channels):
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
-    return GroupNorm32(32, channels)
+    return nn.GroupNorm(32, channels)
 
 
 # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
